@@ -153,7 +153,7 @@ def main():
         if first_open:
             last_open_price[symbol] = first_open
             last_cross_open_state[symbol] = None
-            send_telegram(f"📊 {symbol} – Giá mở cửa đầu ngày (UTC): {first_open}")
+            # send_telegram(f"📊 {symbol} – Giá mở cửa đầu ngày (UTC): {first_open}")
             logger.info(f"{symbol} Open Price UTC: {first_open}")
 
         # --- Cảnh báo BUY/SELL candle/volume ---
@@ -184,3 +184,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
