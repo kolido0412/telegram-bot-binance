@@ -1,134 +1,186 @@
-import time
-import requests
 import logging
+import requests
 import pandas as pd
+from datetime import datetime, timezone
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # ===== CẤU HÌNH NGƯỜI DÙNG =====
-TELEGRAM_BOT_TOKEN = "8357423002:AAGUgGhEQb4vxPUp88PYEOKJfl7HIDzPfpk"  # BotFather cấp
-TELEGRAM_CHAT_ID = "8332206639"  # Chat ID cá nhân hoặc nhóm
-POLL_INTERVAL = 300  # 5 phút giữa 2 lần kiểm tra
-
-# 🔔 Các cảnh báo giá cụ thể
-ALERTS = [
-    {"symbol": "BTCUSDT", "threshold": 107348, "direction": "above"},
-    {"symbol": "BTCUSDT", "threshold": 103628, "direction": "below"},
-    {"symbol": "ETHUSDT", "threshold": 3883, "direction": "above"},
-    {"symbol": "ETHUSDT", "threshold": 3522, "direction": "below"},
-]
-
-# 🔔 Các khung EMA cần theo dõi
-EMA_ALERTS = [
-    {"symbol": "BTCUSDT", "interval": "1h"},
-    {"symbol": "BTCUSDT", "interval": "4h"},
-    {"symbol": "BTCUSDT", "interval": "1d"},
-    {"symbol": "ETHUSDT", "interval": "1h"},
-    {"symbol": "ETHUSDT", "interval": "4h"},
-    {"symbol": "ETHUSDT", "interval": "1d"},
-]
-
-BINANCE_URL_PRICE = "https://fapi.binance.com/fapi/v1/premiumIndex"
+TELEGRAM_BOT_TOKEN = "8357423002:AAGUgGhEQb4vxPUp88PYEOKJfl7HIDzPfpk"
+TELEGRAM_CHAT_ID = "8332206639"
+SYMBOLS = ["BTCUSDT"]
+INTERVALS = ["15m", "30m"]  # Check time
 BINANCE_URL_KLINES = "https://fapi.binance.com/fapi/v1/klines"
-logging.basicConfig(filename="alerts.log", level=logging.INFO,
+
+# Logging
+logging.basicConfig(filename="Alerts_Bot_Volume_Candle.log", level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
+# ===== SESSION CÓ RETRY =====
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# ===== HÀM CHÍNH =====
-
+# ===== HỖ TRỢ GỬI TELEGRAM =====
 def send_telegram(msg):
-    """Gửi tin nhắn Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except Exception as e:
-        logging.error(f"Lỗi gửi Telegram: {e}")
-
-
-def get_price(symbol):
-    """Lấy giá mark price hiện tại"""
-    try:
-        r = requests.get(BINANCE_URL_PRICE, params={"symbol": symbol}, timeout=10)
+        r = session.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        return float(r.json()["markPrice"])
+        logger.info(f"Telegram sent: {msg}")
     except Exception as e:
-        logging.error(f"Lỗi lấy giá {symbol}: {e}")
-        return None
+        logger.error(f"Lỗi gửi Telegram: {e} | msg: {msg}")
 
-
-def get_ema_cross(symbol, interval, length=21):
-    """Kiểm tra xem giá vừa cắt EMA21"""
+# ===== LẤY DỮ LIỆU KLINES =====
+def fetch_klines(symbol, interval, limit=400):
     try:
-        params = {"symbol": symbol, "interval": interval, "limit": 100}
-        r = requests.get(BINANCE_URL_KLINES, params=params, timeout=10)
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = session.get(BINANCE_URL_KLINES, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
-
         df = pd.DataFrame(data, columns=[
-            "time", "open", "high", "low", "close",
+            "open_time", "open", "high", "low", "close",
             "volume", "close_time", "qav", "trades",
             "tbbav", "tbqav", "ignore"
         ])
-        df["close"] = df["close"].astype(float)
-        df["ema"] = df["close"].ewm(span=length).mean()
-
-        # Hai nến cuối
-        prev_close, curr_close = df["close"].iloc[-2], df["close"].iloc[-1]
-        prev_ema, curr_ema = df["ema"].iloc[-2], df["ema"].iloc[-1]
-
-        crossed_up = prev_close < prev_ema and curr_close > curr_ema
-        crossed_down = prev_close > prev_ema and curr_close < curr_ema
-
-        if crossed_up:
-            return f"🔼 {symbol} ({interval}) vừa CẮT LÊN EMA{length} – Giá: {curr_close:.2f}"
-        elif crossed_down:
-            return f"🔽 {symbol} ({interval}) vừa CẮT XUỐNG EMA{length} – Giá: {curr_close:.2f}"
-        else:
-            return None
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        return df
     except Exception as e:
-        logging.error(f"Lỗi tính EMA {symbol} {interval}: {e}")
+        logger.error(f"[fetch_klines] Lỗi lấy klines {symbol} {interval}: {e}")
         return None
 
+# ===== TÍNH TOÁN CHỈ BÁO THEO LOGIC CANDLE/VOLUME =====
+def compute_signals(df):
+    if df is None or len(df) < 50:
+        return None
 
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema233"] = df["close"].ewm(span=233, adjust=False).mean()
+    df["vol89"] = df["volume"].rolling(window=89, min_periods=1).mean()
+    df["candle"] = (df["close"] - df["open"]).abs()
+    df["can89"] = df["candle"].rolling(window=89, min_periods=1).mean()
+
+    idx = -2
+    row = df.iloc[idx]
+
+    close = row["close"]
+    openp = row["open"]
+    ema21 = row["ema21"]
+    ema233 = row["ema233"]
+    vol = row["volume"]
+    vol89 = row["vol89"]
+    candle = row["candle"]
+    can89 = row["can89"]
+
+    conbuy = (
+        (close > openp)
+        and (close > ema21)
+        and (close > ema233)
+        and ((close - ema21) < 2 * candle)
+        and (vol > vol89)
+        and (vol > 2.1 * vol89)
+        and (candle > 2.1 * can89)
+    )
+
+    consell = (
+        (close < openp)
+        and (close < ema21)
+        and (close < ema233)
+        and ((ema21 - close) < 2 * candle)
+        and (vol > vol89)
+        and (vol > 2.1 * vol89)
+        and (candle > 2.1 * can89)
+    )
+
+    return {
+        "time": row["close_time"],
+        "close": close,
+        "open": openp,
+        "ema21": ema21,
+        "ema233": ema233,
+        "volume": vol,
+        "vol89": vol89,
+        "candle": candle,
+        "can89": can89,
+        "conbuy": bool(conbuy),
+        "consell": bool(consell)
+    }
+
+# ===== LẤY GIÁ MỞ CỬA ĐẦU NGÀY =====
+def get_first_open_price(symbol):
+    try:
+        now = datetime.now(timezone.utc)
+        start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        start_ts = int(start_of_day.timestamp() * 1000)
+        end_ts = start_ts + 2 * 60 * 60 * 1000
+
+        params = {
+            "symbol": symbol,
+            "interval": "1h",
+            "startTime": start_ts,
+            "endTime": end_ts,
+            "limit": 2
+        }
+        r = session.get(BINANCE_URL_KLINES, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if len(data) > 0:
+            open_price = float(data[0][1])
+            return open_price
+        return None
+    except Exception as e:
+        logger.error(f"[get_first_open_price] Lỗi {symbol}: {e}")
+        return None
+
+# ===== MAIN CHỈ CHẠY 1 LẦN =====
 def main():
-    last_price_state = {a["symbol"] + str(a["threshold"]) + a["direction"]: None for a in ALERTS}
-    last_ema_state = {f"{a['symbol']}_{a['interval']}": None for a in EMA_ALERTS}
-    logging.info("Bắt đầu theo dõi giá và EMA...")
+    logger.info("Start Bot - Check candle 15m + 30m và Open Price")
+    last_signal = {symbol: {interval: None for interval in INTERVALS} for symbol in SYMBOLS}
+    last_open_price = {}
+    last_cross_open_state = {}
 
-    while True:
-        # 1️⃣ Kiểm tra các ngưỡng giá cụ thể
-        for alert in ALERTS:
-            price = get_price(alert["symbol"])
-            if price is None:
+    for symbol in SYMBOLS:
+        # --- Giá mở cửa đầu ngày ---
+        first_open = get_first_open_price(symbol)
+        if first_open:
+            last_open_price[symbol] = first_open
+            last_cross_open_state[symbol] = None
+            send_telegram(f"📊 {symbol} – Giá mở cửa đầu ngày (UTC): {first_open}")
+            logger.info(f"{symbol} Open Price UTC: {first_open}")
+
+        # --- Cảnh báo BUY/SELL candle/volume ---
+        for interval in INTERVALS:
+            df = fetch_klines(symbol, interval, limit=400)
+            if df is None:
+                continue
+            sig = compute_signals(df)
+            if sig is None:
                 continue
 
-            key = alert["symbol"] + str(alert["threshold"]) + alert["direction"]
-            direction = alert["direction"]
-            threshold = alert["threshold"]
-            was_above = last_price_state[key]
-            is_above = price > threshold
+            now_str = sig["time"].strftime("%Y-%m-%d %H:%M:%S %Z")
+            last = last_signal[symbol][interval]
 
-            # Phát cảnh báo
-            if direction == "above" and (was_above is not True) and is_above:
-                msg = f"🔔 {alert['symbol']} vượt lên {threshold:.2f} → Giá hiện tại: {price:.2f}"
+            if sig["conbuy"] and last != "buy":
+                msg = f"🔵 BUY Signal\n{symbol} | Interval: {interval}"
                 send_telegram(msg)
-                logging.info(msg)
-            elif direction == "below" and (was_above is not False) and not is_above:
-                msg = f"🔔 {alert['symbol']} cắt xuống {threshold:.2f} → Giá hiện tại: {price:.2f}"
+                logger.info(f"{symbol} BUY alert sent at {now_str} | Interval: {interval}")
+                last_signal[symbol][interval] = "buy"
+
+            elif sig["consell"] and last != "sell":
+                msg = f"🔴 SELL Signal\n{symbol} | Interval: {interval}"
                 send_telegram(msg)
-                logging.info(msg)
-
-            last_price_state[key] = is_above
-
-        # 2️⃣ Kiểm tra cắt EMA21
-        for ema_alert in EMA_ALERTS:
-            key = f"{ema_alert['symbol']}_{ema_alert['interval']}"
-            msg = get_ema_cross(ema_alert["symbol"], ema_alert["interval"])
-            if msg and msg != last_ema_state[key]:
-                send_telegram(msg)
-                logging.info(msg)
-                last_ema_state[key] = msg
-
-        time.sleep(POLL_INTERVAL)
-
+                logger.info(f"{symbol} SELL alert sent at {now_str} | Interval: {interval}")
+                last_signal[symbol][interval] = "sell"
+            else:
+                last_signal[symbol][interval] = last
 
 if __name__ == "__main__":
     main()
